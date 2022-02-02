@@ -8,10 +8,12 @@ import struct
 
 
 class SysWhispers(object):
-    def __init__(self):
+    def __init__(self, function_prefix):
+        self.__function_prefix = function_prefix
+
         self.seed = random.randint(2 ** 28, 2 ** 32 - 1)
-        self.typedefs: list = json.load(open(os.path.join(os.path.dirname(__file__), "data", "typedefs.json")))
-        self.prototypes: dict = json.load(open(os.path.join(os.path.dirname(__file__), "data", "prototypes.json")))
+        self.typedefs: list = json.load(open('./data/typedefs.json'))
+        self.prototypes: dict = json.load(open('./data/prototypes.json'))
 
     def generate(self, function_names: list = (), basename: str = 'syscalls'):
         if not function_names:
@@ -19,8 +21,20 @@ class SysWhispers(object):
         elif any([f not in self.prototypes.keys() for f in function_names]):
             raise ValueError('Prototypes are not available for one or more of the requested functions.')
 
+        # Change default function prefix.
+        if self.__function_prefix != 'Nt':
+            new_function_names = []
+            for function_name in function_names:
+                new_function_name = function_name.replace('Nt', self.__function_prefix, 1)
+                if new_function_name != function_name:
+                    self.prototypes[new_function_name] = self.prototypes[function_name]
+                    del self.prototypes[function_name]
+                new_function_names.append(new_function_name)
+
+            function_names = new_function_names
+
         # Write C file.
-        with open (os.path.join(os.path.dirname(__file__), "data", "base.c"), 'rb') as base_source:
+        with open ('./data/base.c', 'rb') as base_source:
             with open(f'{basename}.c', 'wb') as output_source:
                 base_source_contents = base_source.read().decode()
                 base_source_contents = base_source_contents.replace('<BASENAME>', os.path.basename(basename), 1)
@@ -31,13 +45,18 @@ class SysWhispers(object):
         basename_suffix = basename_suffix.capitalize() if os.path.basename(basename).istitle() else basename_suffix
         basename_suffix = f'_{basename_suffix}' if '_' in basename else basename_suffix
         with open(f'{basename}{basename_suffix}.asm', 'wb') as output_asm:
-            output_asm.write(b'.code\n\nEXTERN SW2_GetSyscallNumber: PROC\n\n')
+            if args.architecture == 'x64':
+                output_asm.write(b'.CODE\n\nEXTERN SW2_GetSyscallNumber: PROC\n\n')
+            elif args.architecture == 'x86_64':
+                output_asm.write(b'.MODEL FLAT, C\n.CODE\n\nASSUME FS:NOTHING\n\nEXTERN SW2_GetSyscallNumber: PROC\n\n')
+            else:
+                raise ValueError('ERROR: Invalid defined architecture. Must be "x64" or "x86_64".')
             for function_name in function_names:
                 output_asm.write((self._get_function_asm_code(function_name) + '\n').encode())
-            output_asm.write(b'end')
+            output_asm.write(b'END')
 
         # Write header file.
-        with open(os.path.join(os.path.dirname(__file__), "data", "base.h"), 'rb') as base_header:
+        with open('./data/base.h', 'rb') as base_header:
             with open(f'{basename}.h', 'wb') as output_header:
                 # Replace <SEED_VALUE> with a random seed.
                 base_header_contents = base_header.read().decode()
@@ -124,7 +143,7 @@ class SysWhispers(object):
 
     def _get_function_hash(self, function_name: str):
         hash = self.seed
-        name = function_name.replace('Nt', 'Zw', 1) + '\0'
+        name = function_name.replace(self.__function_prefix, 'Zw', 1) + '\0'
         ror8 = lambda v: ((v >> 8) & (2 ** 32 - 1)) | ((v << 24) & (2 ** 32 - 1))
 
         for segment in [s for s in [name[i:i + 2] for i in range(len(name))] if len(s) == 2]:
@@ -136,25 +155,46 @@ class SysWhispers(object):
     def _get_function_asm_code(self, function_name: str) -> str:
         function_hash = self._get_function_hash(function_name)
 
-        # Generate 64-bit ASM code.
         code = ''
-        code += f'{function_name} PROC\n'
-        code += '\tmov [rsp +8], rcx          ; Save registers.\n'
-        code += '\tmov [rsp+16], rdx\n'
-        code += '\tmov [rsp+24], r8\n'
-        code += '\tmov [rsp+32], r9\n'
-        code += '\tsub rsp, 28h\n'
-        code += f'\tmov ecx, 0{function_hash:08X}h        ; Load function hash into ECX.\n'
-        code += '\tcall SW2_GetSyscallNumber  ; Resolve function hash into syscall number.\n'
-        code += '\tadd rsp, 28h\n'
-        code += '\tmov rcx, [rsp +8]          ; Restore registers.\n'
-        code += '\tmov rdx, [rsp+16]\n'
-        code += '\tmov r8, [rsp+24]\n'
-        code += '\tmov r9, [rsp+32]\n'
-        code += '\tmov r10, rcx\n'
-        code += '\tsyscall                    ; Invoke system call.\n'
-        code += '\tret\n'
-        code += f'{function_name} ENDP\n'
+
+        # Generate 64-bit ASM code.
+        if args.architecture == 'x64':
+            code += f'{function_name} PROC\n'
+            code += '\tmov [rsp +8], rcx          ; Save registers.\n'
+            code += '\tmov [rsp+16], rdx\n'
+            code += '\tmov [rsp+24], r8\n'
+            code += '\tmov [rsp+32], r9\n'
+            code += '\tsub rsp, 28h\n'
+            code += f'\tmov ecx, 0{function_hash:08X}h        ; Load function hash into ECX.\n'
+            code += '\tcall SW2_GetSyscallNumber  ; Resolve function hash into syscall number.\n'
+            code += '\tadd rsp, 28h\n'
+            code += '\tmov rcx, [rsp +8]          ; Restore registers.\n'
+            code += '\tmov rdx, [rsp+16]\n'
+            code += '\tmov r8, [rsp+24]\n'
+            code += '\tmov r9, [rsp+32]\n'
+            code += '\tmov r10, rcx\n'
+            code += '\tsyscall                    ; Invoke system call.\n'
+            code += '\tret\n'
+            code += f'{function_name} ENDP\n'
+        
+        # Generate 32-bit ASM code
+        elif args.architecture == 'x86_64':
+            code += f'{function_name} PROC\n'
+            code += f'\tpush 0{function_hash:08X}h\n'
+            code += '\tcall SW2_GetSyscallNumber  ; Resolve function hash into syscall number.\n'
+            code += '\tadd esp, 4\n'
+            code += '\tmov ecx, fs:[0c0h]\n'
+            code += '\ttest ecx, ecx\n'
+            code += '\tjne _wow64\n'
+            code += '\tlea edx, [esp+4h]\n'
+            code += '\tINT 02eh\n'
+            code += '\tret\n'
+            code += '\t_wow64:\n'
+            code += '\txor ecx, ecx\n'
+            code += '\tlea edx, [esp+4h]\n'
+            code += '\tcall dword ptr fs:[0c0h]\n'
+            code += '\tret\n'
+            code += f'{function_name} ENDP\n'
 
         return code
 
@@ -175,9 +215,11 @@ if __name__ == '__main__':
     parser.add_argument('-p', '--preset', help='Preset ("all", "common")', required=False)
     parser.add_argument('-f', '--functions', help='Comma-separated functions', required=False)
     parser.add_argument('-o', '--out-file', help='Output basename (w/o extension)', required=True)
+    parser.add_argument('-a', '--architecture', default='x64', help='Define architecture, x86_64 or x64, default x64', required=False)
+    parser.add_argument('--function-prefix', default='Nt', help='Function prefix', required=False)
     args = parser.parse_args()
 
-    sw = SysWhispers()
+    sw = SysWhispers(args.function_prefix)
 
     if args.preset == 'all':
         print('All functions selected.\n')
